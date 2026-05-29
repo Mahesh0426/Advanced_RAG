@@ -64,6 +64,7 @@ print("\nretriever:", retriever)
 # WITHOUT retriever
 # this method is not used generally inside chains, or if you require customizations then 
 # also you do not use this method
+# similarity_search = direct function call
 
 query = "How do cells generate their energy?"
 results = vectorstore.similarity_search(query, k=3)
@@ -76,7 +77,7 @@ for i, doc in enumerate(results, 1):
 
 
 # retrievers in langchain are runnables, create chains using retrievers
-
+# retriever = standardized interface
 results2 = retriever.invoke(query)
 
 # All returned documents should be from the space topic
