@@ -45,7 +45,7 @@ print("\nVector store is ready.")
 query = "deep learning model training and its optimization techniques"
 print(f"\nQuery: {query}\n")
 
-# similarity search simple one 
+# similarity search simple one  without mmr
 sim_retriever = vectorstore.as_retriever(
     search_type="similarity",
     search_kwargs={"k": 3},

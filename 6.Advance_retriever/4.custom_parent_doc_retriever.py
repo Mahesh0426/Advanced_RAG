@@ -1,3 +1,30 @@
+# =============================================================================
+# Custom Parent Document Retriever — Built from scratch using BaseRetriever
+# =============================================================================
+# The core tension in RAG chunking:
+#
+#   Small chunks  → precise embeddings, high similarity scores, but too little
+#                   context for the LLM to synthesize a good answer
+#
+#   Large chunks  → rich context for the LLM, but diluted embeddings that match
+#                   too broadly and surface irrelevant documents
+#
+# Parent Document Retriever resolves this tension by maintaining TWO views of
+# the same content:
+#
+#   Child chunks  (small, ~400 chars)  → stored in ChromaDB for vector search
+#   Parent chunks (large, ~1500 chars) → stored in InMemoryStore as the answer context
+#
+# Retrieval flow:
+#   1. Embed the query and find the most similar CHILD chunks (precise match)
+#   2. Read each child's metadata to find its PARENT chunk ID
+#   3. Fetch the full PARENT chunks from the docstore
+#   4. Return parent chunks to the LLM (rich context)
+#
+# This gives you the best of both worlds: embedding precision from small chunks,
+# answer quality from large chunks.
+# =============================================================================
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -10,8 +37,15 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_classic.storage import InMemoryStore
 
-
+# ── Embedding setup ───────────────────────────────────────────────────────────
+# Converts text to dense vectors. Used by ChromaDB when indexing child chunks
+# and when embedding the query at retrieval time.
 embeddings = OpenAIEmbeddings(model='text-embedding-3-small')
+
+# ── Sample documents ──────────────────────────────────────────────────────────
+# Five long, information-dense documents on AI topics.
+# Because they're long, naive single-chunk indexing would produce diluted
+# embeddings — exactly the problem this retriever is designed to solve.
 
 docs = [
     Document(
@@ -198,49 +232,120 @@ docs = [
 
 print(f'Created {len(docs)} documents')
 
+# ── Splitter configuration ────────────────────────────────────────────────────
+# Two splitters with deliberately different sizes are the heart of this pattern.
+#
+# parent_splitter (chunk_size=1500)
+#   Produces medium-sized chunks with enough context for the LLM to reason over.
+#   chunk_overlap=200 ensures sentences at boundaries appear in at least one chunk.
+#   These chunks are stored in the docstore and returned as the final answer context.
+#
+# child_splitter (chunk_size=400)
+#   Produces small, focused chunks whose embeddings capture a single idea precisely.
+#   chunk_overlap=50 prevents sentences from being silently cut at boundaries.
+#   These chunks are indexed in ChromaDB and used only for similarity search.
+#
+# Rule of thumb: parent ~3-5× larger than child so retrieval is precise but
+# the returned context is still rich enough to answer multi-sentence questions.
 parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
 child_splitter  = RecursiveCharacterTextSplitter(chunk_size=400,  chunk_overlap=50)
 
+
+# ── Custom retriever class ────────────────────────────────────────────────────
+# Subclasses BaseRetriever to integrate cleanly with all LangChain chains and agents.
+# Two storage backends serve distinct roles — neither could do both jobs well alone:
 #
+#   vectorstore (ChromaDB)
+#     Persistent vector DB optimised for ANN (approximate nearest-neighbour) search.
+#     Stores child chunks + their embeddings. Fast similarity_search at query time.
+#
+#   docstore (InMemoryStore)
+#     Simple key-value store. Stores parent chunks keyed by UUID.
+#     mset() writes, mget() reads — no vector math involved, just a dictionary lookup.
+#
+# The UUID-based link between child metadata and docstore keys is what ties the
+# two stores together. Losing that link (e.g. missing id_key metadata) would
+# cause silent retrieval failures, so every child is tagged before indexing.
 class CustomParentDocumentRetriever(BaseRetriever):
     """Retriever that indexes small child chunks for search but returns larger parent chunks."""
 
-    vectorstore: Any    # Chroma — stores child chunks for similarity search
+    vectorstore: Any    # Chroma — stores child chunk embeddings for similarity search
     docstore: Any       # InMemoryStore — stores parent chunks keyed by UUID
     child_splitter: Any
     parent_splitter: Any
+
+    # Metadata key used to link every child chunk back to its parent's UUID.
+    # Must be consistent between add_documents() and _get_relevant_documents().
     id_key: str = 'parent_doc_id'
 
     def add_documents(self, docs: list[Document]) -> None:
-        # Step 1 & 2: split raw documents into parent chunks
+        """Index documents into both stores: children → ChromaDB, parents → docstore."""
+
+        # Step 1: split each raw document into parent-sized chunks.
+        # Each parent chunk is an independent unit of context — large enough
+        # to be informative, small enough to stay within LLM context limits.
         parent_chunks = self.parent_splitter.split_documents(docs)
+
         for parent in parent_chunks:
-            # Step 2: assign a unique ID to each parent chunk
+            # Step 2: generate a unique ID for this parent chunk.
+            # UUID4 is random — no collision risk even across multiple add_documents() calls.
             parent_id = str(uuid.uuid4())
-            # Step 3: split each parent into smaller child chunks
+
+            # Step 3: split the parent chunk into smaller child chunks.
+            # Splitting one parent at a time ensures children never span two parents,
+            # so the parent lookup will always return the correct surrounding context.
             children = self.child_splitter.split_documents([parent])
-            # tag every child with its parent's ID so we can look it up later
+
+            # Tag every child with its parent's UUID before indexing.
+            # This metadata field is the only bridge between the two stores —
+            # it's what lets _get_relevant_documents() map child → parent later.
             for child in children:
                 child.metadata[self.id_key] = parent_id
-            # Step 3: store children in ChromaDB for semantic similarity search
+
+            # Step 4: add the tagged child chunks to ChromaDB.
+            # ChromaDB embeds each child and stores the vector + metadata.
+            # Only the children live here — parents are never put in the vector store.
             self.vectorstore.add_documents(children)
-            # Step 4: store the parent in InMemoryStore keyed by its UUID
-            self.docstore.mset([(parent_id, parent)]) # mset --> dict1[parent_id] = parent
+
+            # Step 5: persist the parent chunk in the docstore under its UUID.
+            # mset() accepts a list of (key, value) pairs — writing one parent at a time.
+            # mset --> conceptually: docstore[parent_id] = parent
+            self.docstore.mset([(parent_id, parent)])
 
     def _get_relevant_documents(self, query: str) -> list[Document]:
-        # Step 5: similarity search retrieves the most relevant child chunks
+        """Search child chunks, then fetch and return their parent chunks."""
+
+        # Step 6: embed the query and find the k most similar child chunks.
+        # Small, focused child chunks produce precise similarity scores —
+        # this is where the "search small" part of the strategy pays off.
         child_docs = self.vectorstore.similarity_search(query, k=3)
-        # Step 6: collect unique parent IDs from child metadata (dict.fromkeys preserves order)
+
+        # Step 7: extract the parent UUID from each retrieved child's metadata.
+        # dict.fromkeys() is used instead of a plain list to deduplicate while
+        # preserving the order of first occurrence — important if two children
+        # from the same parent both appear in the top-k results (which is common).
         parent_ids = list(dict.fromkeys(
             doc.metadata[self.id_key] for doc in child_docs
-            if self.id_key in doc.metadata
+            if self.id_key in doc.metadata  # guard against missing metadata
         ))
-        # Step 6: fetch and return the corresponding parent documents
-        return [doc for doc in self.docstore.mget(parent_ids) if doc is not None] # mget --> dict1[parent_id]
+
+        # Step 8: batch-fetch all matched parent chunks from the docstore in one call.
+        # mget() returns a list in the same order as parent_ids, with None for any
+        # missing key — the filter removes those so we never return None to the caller.
+        # mget --> conceptually: [docstore[pid] for pid in parent_ids]
+        return [doc for doc in self.docstore.mget(parent_ids) if doc is not None]
 
 
+# ── Instantiate stores and retriever ─────────────────────────────────────────
+
+# ChromaDB collection for child chunk vectors.
+# collection_name scopes this index — useful when sharing a Chroma instance
+# across multiple retrievers or projects.
 vectorstore = Chroma(collection_name='custom_children', embedding_function=embeddings)
 
+# Simple in-memory key-value store for parent chunks.
+# For production use, swap this with a Redis, SQL, or file-backed store
+# so parents survive process restarts.
 docstore = InMemoryStore()
 
 retriever = CustomParentDocumentRetriever(
@@ -250,12 +355,23 @@ retriever = CustomParentDocumentRetriever(
     parent_splitter=parent_splitter,
 )
 
+# ── Index all documents ───────────────────────────────────────────────────────
+# add_documents() triggers the full parent→child split and dual-store indexing.
+# After this call: vectorstore holds many small child chunks,
+#                  docstore holds fewer, larger parent chunks.
 retriever.add_documents(docs)
 
+# Sanity check: child count should be significantly higher than parent count,
+# confirming the two-tier split is working as expected.
 parent_count = len(list(docstore.yield_keys()))
 child_count  = len(vectorstore.get()['ids'])
 print(f'Parent chunks: {parent_count}  |  Child chunks: {child_count}\n')
 
+# ── Retrieval ─────────────────────────────────────────────────────────────────
+# .invoke() calls _get_relevant_documents() under the hood.
+# Even though the query matches a specific concept (Transformer self-attention),
+# the returned documents are full parent chunks — giving the LLM the wider
+# context it needs to produce a complete, accurate answer.
 query = 'How do transformer architectures work in deep learning?'
 
 results = retriever.invoke(query)

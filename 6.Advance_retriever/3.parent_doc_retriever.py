@@ -1,3 +1,29 @@
+# =============================================================================
+# ParentDocumentRetriever — LangChain built-in with two docstore backends
+# =============================================================================
+# This file demonstrates LangChain's built-in ParentDocumentRetriever, which
+# implements the same "search small, return large" pattern as the custom version
+# but with less boilerplate — UUID generation, child tagging, and the
+# child→parent lookup are all handled internally.
+#
+# The key new concept here is the docstore backend comparison:
+#
+#   Part 1 — InMemoryStore
+#     Stores parent Document objects directly in a Python dict.
+#     Fast, zero-config, but lost on process restart.
+#     Best for: prototyping, scripts, tests.
+#
+#   Part 2 — LocalFileStore + create_kv_docstore
+#     Serializes parent Document objects to JSON files on disk.
+#     Survives process restarts — re-instantiating the retriever with the
+#     same directory will load previously indexed parents without re-embedding.
+#     Best for: local development where you want persistence between runs.
+#
+# Both parts use the same query and produce identical results, demonstrating
+# that the choice of docstore is purely an operational concern — it has no
+# effect on retrieval quality.
+# =============================================================================
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -8,8 +34,15 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_classic.retrievers import ParentDocumentRetriever
 from langchain_classic.storage import InMemoryStore, LocalFileStore, create_kv_docstore
 
-# No LLM needed — retrieval is purely embedding-based
+# No LLM needed — retrieval is purely embedding-based.
+# Unlike MultiQueryRetriever, ParentDocumentRetriever never calls an LLM;
+# it just moves between two storage tiers using vector similarity.
 embeddings = OpenAIEmbeddings(model='text-embedding-3-small')
+
+# ── Sample documents ──────────────────────────────────────────────────────────
+# Five long AI-topic documents. Their length is intentional — each spans
+# multiple concepts, so naive single-chunk indexing would dilute embeddings
+# and hurt recall. The parent/child split solves this.
 
 docs = [
     Document(
@@ -196,19 +229,46 @@ docs = [
 
 print(f'Created {len(docs)} documents')
 
+# ── Splitter configuration ────────────────────────────────────────────────────
 # parent_splitter produces larger chunks stored in the docstore;
-# child_splitter produces smaller chunks indexed in the vectorstore for precise retrieval
+# child_splitter produces smaller chunks indexed in the vectorstore for precise retrieval.
+#
+# parent (chunk_size=1500, overlap=200): rich context for LLM answer generation.
+# child  (chunk_size=400,  overlap=50):  focused single-idea chunks for precise embeddings.
+# The ~3-4× size ratio is the key design choice — large enough parents to be
+# useful, small enough children to embed accurately.
 parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
 child_splitter  = RecursiveCharacterTextSplitter(chunk_size=400,  chunk_overlap=50)
 
-# --- Part 1: InMemoryStore ---
-# InMemoryStore holds Document objects directly in a Python dict — no serialization needed
+
+# =============================================================================
+# Part 1: InMemoryStore
+# =============================================================================
+# InMemoryStore holds Document objects directly in a Python dict — no serialization needed.
+# It is the simplest possible docstore: fast, zero-config, but ephemeral.
+# All parent chunks disappear when the Python process ends.
+# Use this for: experimentation, unit tests, one-shot scripts.
+# =============================================================================
+
 store_memory = InMemoryStore()
+
+# A separate ChromaDB collection for Part 1 — using distinct collection names
+# ('memory_children' vs 'fs_children') prevents the two parts from mixing
+# their child chunks inside the same Chroma instance.
 vectorstore_memory = Chroma(
     collection_name='memory_children',
     embedding_function=embeddings,
 )
 
+# ParentDocumentRetriever is the built-in equivalent of the CustomParentDocumentRetriever
+# from the previous file. Internally it handles:
+#   - Splitting each raw doc into parent chunks, then child chunks
+#   - Generating a UUID per parent and stamping it onto every child's metadata
+#   - Writing children to vectorstore and parents to docstore
+#   - At query time: similarity search on children → lookup parents → return parents
+#
+# search_kwargs={'k': 3} controls how many child chunks are retrieved per query;
+# the number of returned parent chunks will be ≤ 3 (fewer if children share a parent).
 retriever_memory = ParentDocumentRetriever(
     vectorstore=vectorstore_memory,
     docstore=store_memory,
@@ -218,7 +278,8 @@ retriever_memory = ParentDocumentRetriever(
 )
 retriever_memory.add_documents(docs)
 
-# child count >> parent count shows the key trade-off being managed
+# child count >> parent count confirms the two-tier split is working:
+# many small searchable chunks mapping back to fewer, richer answer chunks.
 parent_count = len(list(store_memory.yield_keys()))
 child_count  = len(vectorstore_memory.get()['ids'])
 print(f'InMemoryStore  |  parent chunks: {parent_count}  |  child chunks in vectorstore: {child_count}')
@@ -234,18 +295,41 @@ for i, doc in enumerate(results_memory):
     print()
 
 
-# --- Part 2: LocalFileStore ---
-# LocalFileStore is a ByteStore — it can only persist raw bytes to disk.
-# create_kv_docstore wraps it with LangChain's JSON serializer so
-# ParentDocumentRetriever can store and retrieve Document objects transparently.
+# =============================================================================
+# Part 2: LocalFileStore + create_kv_docstore
+# =============================================================================
+# LocalFileStore is a ByteStore — it writes raw bytes to files under the given
+# directory path. Each parent chunk becomes its own file on disk, named by its UUID.
+#
+# The critical detail: LocalFileStore only understands bytes, but
+# ParentDocumentRetriever needs to store and retrieve LangChain Document objects.
+#
+# create_kv_docstore bridges this gap — it wraps the ByteStore with a JSON
+# serializer/deserializer so Document objects are transparently converted to
+# bytes on write and reconstructed on read.
+#
+# Persistence benefit: if you restart your script and re-instantiate the
+# retriever pointing to the same directory and Chroma collection, the parent
+# chunks are already on disk and you can skip add_documents() entirely.
+# =============================================================================
+
+# './local_parent_store' is the directory where parent chunk JSON files are written.
+# The directory is created automatically if it doesn't exist.
 fs = LocalFileStore('./local_parent_store')
+
+# Wrap the raw ByteStore with JSON serialization so Document objects can be
+# stored and retrieved without any manual serialization code.
 store_fs = create_kv_docstore(fs)
 
+# Separate Chroma collection keeps Part 2's child chunks isolated from Part 1's.
 vectorstore_fs = Chroma(
     collection_name='fs_children',
     embedding_function=embeddings,
 )
 
+# Identical configuration to Part 1 — only the docstore backend differs.
+# This is the key architectural point: swapping InMemoryStore → LocalFileStore
+# requires no changes to the retriever's retrieval logic or chunking strategy.
 retriever_fs = ParentDocumentRetriever(
     vectorstore=vectorstore_fs,
     docstore=store_fs,
@@ -255,14 +339,16 @@ retriever_fs = ParentDocumentRetriever(
 )
 retriever_fs.add_documents(docs)
 
+# yield_keys() on the raw LocalFileStore lists the UUID filenames written to disk —
+# confirming that parent chunks were actually persisted, not just held in memory.
 disk_count = len(list(fs.yield_keys()))
 child_count_fs = len(vectorstore_fs.get()['ids'])
 print(f'LocalFileStore  |  parent chunks on disk: {disk_count}  |  child chunks in vectorstore: {child_count_fs}')
 
-
-# same query — results should be identical to Part 1, proving store parity
+# Same query — results should be identical to Part 1, proving store parity:
+# the docstore backend is transparent to retrieval quality.
 results_fs = retriever_fs.invoke(query)
-print("query:",query)
+print("query:", query)
 print()
 print(f'Retrieved {len(results_fs)} parent chunk(s) from LocalFileStore:\n')
 for i, doc in enumerate(results_fs):

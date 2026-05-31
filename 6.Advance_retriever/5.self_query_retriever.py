@@ -6,11 +6,23 @@ from langchain_classic.retrievers import SelfQueryRetriever
 from langchain_classic.chains.query_constructor.schema import AttributeInfo
 from langchain_community.query_constructors.chroma import ChromaTranslator
 
+# Load API keys and environment variables from .env file
 load_dotenv()
 
+# Initialize the embedding model to convert text into vector representations.
+# "text-embedding-3-small" is OpenAI's efficient model for semantic similarity tasks.
 embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+# Initialize the LLM that will parse natural language queries into structured filters.
+# temperature=0 ensures deterministic, consistent query parsing (no randomness).
 llm = ChatOpenAI(model="gpt-5", temperature=0)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DATASET: A small in-memory movie corpus.
+# Each Document has:
+#   - page_content : free-text plot description (used for semantic/vector search)
+#   - metadata     : structured fields (used for hard filters like genre, year, rating)
+# ─────────────────────────────────────────────────────────────────────────────
 docs = [
     Document(
         page_content="A masked vigilante fights crime in a corrupt city with the help of a billionaire's technology. An iconic supervillain pushes him to his limits in a battle for Gotham's soul.",
@@ -48,13 +60,26 @@ docs = [
 
 print(f"Created {len(docs)} movie documents")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# VECTOR STORE: Embed all documents and store them in a local ChromaDB collection.
+# Each document's page_content is converted into a vector and indexed.
+# This enables semantic similarity search later.
+# ─────────────────────────────────────────────────────────────────────────────
 vectorstore = Chroma.from_documents(docs, 
                                     embedding=embeddings,
                                     collection_name="movies_collection")
 
 print("\n Vector store is ready..\n")
 
-# AttributeInfo tells the LLM what metadata fields exist and how to filter on them
+# ─────────────────────────────────────────────────────────────────────────────
+# METADATA SCHEMA: Describe every filterable metadata field to the LLM.
+# The LLM uses these descriptions to understand what fields it can filter on
+# when it parses a natural language query into a structured query.
+#
+# Example: For "sci-fi movies after 2010", the LLM knows:
+#   - "genre" is a string it can match against → genre == "sci-fi"
+#   - "year" is an integer it can compare → year > 2010
+# ─────────────────────────────────────────────────────────────────────────────
 metadata_field_info = [
     AttributeInfo(name="title", description="The title of the movie", type="string"),
     AttributeInfo(name="genre", description="The genre of the movie (action, sci-fi, drama, comedy)", type="string"),
@@ -63,9 +88,34 @@ metadata_field_info = [
     AttributeInfo(name="director", description="The director of the movie", type="string"),
 ]
 
-
+# A plain-English description of what the page_content field contains.
+# The LLM uses this to understand which part of the query should drive
+# semantic search vs. which part should become a metadata filter.
 document_content_description = "Brief plot descriptions of movies"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SELF QUERY RETRIEVER: The core component of this script.
+#
+# How it works (two-step process):
+#   Step 1 — Query Construction (LLM):
+#     The LLM reads the natural language query and splits it into:
+#       a) A semantic search string  → searches against page_content vectors
+#       b) A structured metadata filter → applied as a hard WHERE-style clause
+#
+#   Step 2 — Filtered Vector Search (ChromaDB):
+#     ChromaDB runs the vector similarity search with the metadata filter applied,
+#     so only documents that pass both conditions are returned.
+#
+# Example — query: "sci-fi movies released after 2010"
+#   → semantic query : "sci-fi movies"
+#   → metadata filter: { genre == "sci-fi" AND year > 2010 }
+#
+# ChromaTranslator converts the LLM's abstract filter AST into ChromaDB's
+# native "where" clause format that Chroma can actually execute.
+#
+# enable_limit=True allows the LLM to also extract a result count from the query.
+# Example — "recommend me 2 sci-fi movies" → limit=2 is passed to the search.
+# ─────────────────────────────────────────────────────────────────────────────
 retriever = SelfQueryRetriever.from_llm(
     llm=llm,
     vectorstore=vectorstore,
@@ -75,6 +125,21 @@ retriever = SelfQueryRetriever.from_llm(
     enable_limit=True
 )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TEST QUERIES — uncomment to explore different retrieval behaviours:
+#
+#   "What are some sci-fi movies released after 2010"
+#     → filter: genre=="sci-fi" AND year>2010
+#
+#   "Recommend me 2 sci-fi movies released after 2000"
+#     → filter: genre=="sci-fi" AND year>2000, limit=2
+#
+#   "movie about a superhero who is a billionaire by day and a masked vigilante by night"
+#     → pure semantic search (no metadata filter), matches The Dark Knight by plot similarity
+#
+#   "What movies did Christopher Nolan direct?"
+#     → filter: director=="Christopher Nolan" (no semantic component needed)
+# ─────────────────────────────────────────────────────────────────────────────
 # query = "What are some sci-fi movies released after 2010"
 # query = "Recommend me 2 sci-fi movies released after 2000"
 # query = "movie about a superhero who is a billionaire by day and a masked vigilante by night"
@@ -84,7 +149,15 @@ query = "What movies did Christopher Nolan direct?"
 print("\nquery:",query)
 print()
 
-# create the vs retriever
+# ─────────────────────────────────────────────────────────────────────────────
+# BASELINE: Plain vector similarity search (no metadata filtering).
+# Converts the query into a vector and returns the top-k most similar documents
+# purely based on semantic closeness of their plot descriptions.
+#
+# Limitation: For a query like "Christopher Nolan movies", this may return
+# thematically similar films from other directors because it only understands
+# meaning, not structured facts like who directed what.
+# ─────────────────────────────────────────────────────────────────────────────
 vs_retriever = vectorstore.as_retriever(search_type="similarity",
                                         search_kwargs={"k": 3})
 results = vs_retriever.invoke(query)
@@ -94,7 +167,16 @@ for doc in results:
     print(f"  {doc.page_content[:100]}...")
     print()
 
-# LLM extracts: semantic query="sci-fi movies", filter={genre: "sci-fi", year > 2005}
+# ─────────────────────────────────────────────────────────────────────────────
+# SELF QUERY RETRIEVAL: Combines semantic search with LLM-generated metadata filters.
+#
+# For query "What movies did Christopher Nolan direct?":
+#   The LLM extracts → filter: { director == "Christopher Nolan" }
+#   ChromaDB applies the filter first, then ranks results by vector similarity.
+#
+# This guarantees that ONLY Christopher Nolan films are returned,
+# unlike plain similarity search which might surface other directors' films.
+# ─────────────────────────────────────────────────────────────────────────────
 results = retriever.invoke(query) # metadata --> {"genre": "sci-fi", "year": >= 2005}
 print("\nSelfQueryRetriever:\n")
 for doc in results:
