@@ -32,12 +32,17 @@ from dotenv import load_dotenv
 from langchain_core.documents import Document
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.retrievers import ContextualCompressionRetriever
-from langchain.retrievers.document_compressors import (
+from langchain_classic.retrievers import ContextualCompressionRetriever
+from langchain_classic.retrievers.document_compressors import (
     LLMChainExtractor,
     EmbeddingsFilter,
     DocumentCompressorPipeline,
 )
+# from langchain.retrievers.document_compressors import (
+#     LLMChainExtractor,
+#     EmbeddingsFilter,
+#     DocumentCompressorPipeline,
+# )
 
 # Load OPENAI_API_KEY (and any other vars) from the .env file
 load_dotenv()
@@ -53,7 +58,7 @@ embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
 # LLM: used only by LLMChainExtractor to read a doc and extract relevant sentences
 # temperature=0 keeps output deterministic (no creativity needed here)
-llm = ChatOpenAI(model="gpt-4-mini", temperature=0)
+llm = ChatOpenAI(model="gpt-5-mini", temperature=0)
 
 
 # =============================================================================
