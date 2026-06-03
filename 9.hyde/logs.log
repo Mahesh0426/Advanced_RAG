@@ -1,0 +1,78 @@
+2026-06-03 22:37:57 - Hypothetical document generated:
+Transformer models use attention mechanisms as the core means to process sequences. Attention replaces recurrence and convolution by computing data-dependent weighted sums over the entire input (or parts of it), allowing the model to capture long-range dependencies, parallelize computation across positions, and dynamically route information between tokens. The following explains how attention is formulated, implemented, and used inside a transformer to process sequences.
+
+1. Core idea: queries, keys, values
+- Each token in a sequence is represented as a vector (an embedding). For attention, each token produces three vectors: a query q, a key k, and a value v.
+- Attention answers the question: for a given query q (corresponding to a target position), how much should it attend to every key k (corresponding to source positions)? The attention output for that query is a weighted sum of the corresponding values v, with weights determined by the similarity between q and each k.
+
+2. Scaled dot‑product attention (standard building block)
+- Given matrices Q, K, V (queries, keys, values) with shapes (n, d_k), (m, d_k), (m, d_v) respectively (n = number of queries, m = number of keys/values), the scaled dot-product attention is:
+  Attention(Q, K, V) = softmax(Q K^T / sqrt(d_k)) V
+- The dot products Q K^T produce an (n × m) matrix of pairwise similarities; dividing by sqrt(d_k) stabilizes gradients and softmax behavior for larger d_k; softmax converts similarities into nonnegative weights that sum to 1 across keys; multiplication by V produces the final (n × d_v) attended representations.
+- Special-case: when n = m (self-attention), each position attends to all positions (including itself) in the same sequence.
+
+3. Multi-head attention
+- Instead of a single attention, transformers use H parallel attention “heads.” Each head projects inputs to head-specific subspaces:
+  For head i: Q_i = Q W_Q^i, K_i = K W_K^i, V_i = V W_V^i
+  where W_Q^i, W_K^i, W_V^i are learned projection matrices to dimension d_k (typically d_k = d_model / H).
+- Each head computes scaled dot-product attention independently, producing outputs of size (n, d_k). Outputs of all heads are concatenated and linearly projected back to model dimension:
+  MultiHead(Q,K,V) = Concat(head_1, ..., head_H) W_O
+- Rationale: different heads can focus on different types of relationships (syntactic, semantic, positional), enabling the model to capture multiple aspects of token interactions.
+
+4. Positional information
+- Attention is permutation-equivariant: without additional signals, it cannot distinguish order. Transformers inject position information into token representations so the model can use order.
+- Two common approaches:
+  - Sinusoidal positional encodings: deterministic sin/cos functions added to embeddings, encoding relative periodic patterns at different frequencies.
+  - Learned positional embeddings: learned vectors added to token embeddings.
+- Variants include relative positional encodings (where attention scores are biased by relative distances) that often improve modeling of relative order.
+
+5. Transformer layer structure (encoder/decoder)
+- Encoder block: each encoder layer typically contains:
+  1) Multi-head self-attention over the input sequence (each position attends to all positions),
+  2) Add & Norm (residual connection + layer normalization),
+  3) Positionwise feed-forward network (two-layer MLP applied independently to each position),
+  4) Add & Norm.
+- Decoder block (for sequence generation) typically contains:
+  1) Masked multi-head self-attention (causal mask prevents attending to future positions),
+  2) Add & Norm,
+  3) Multi-head cross-attention over encoder outputs (decoder queries attend to encoder keys/values),
+  4) Add & Norm,
+  5) Feed-forward,
+  6) Add & Norm.
+- Stacking multiple layers allows repeated refinement: outputs of one layer become queries/keys/values for the next.
+
+6. Masking and autoregressive decoding
+- For autoregressive (left-to-right) generation, the decoder’s self-attention uses a causal mask that sets logits for future keys to −∞ before softmax so a position cannot attend to later positions.
+- Padding masks can also be applied to ignore padded positions in variable-length sequences.
+
+7. Interpretability and attention weights
+- The softmax weights (attention maps) indicate how much each query attends to each key. These weights are often inspected to understand which tokens the model considers relevant for a prediction. While informative, attention maps are not a perfect explanation of model behavior.
+
+8. Computational characteristics
+- Complexity: standard self-attention computes an (n × n) similarity matrix, giving time and memory cost O(n^2 · d) per layer (n = sequence length, d = hidden dimension). This makes very long sequences expensive.
+- Advantages: unlike RNNs, attention layers are fully parallelizable across positions, enabling efficient training on modern hardware (GPUs/TPUs).
+
+9. Limitations and scalable variants
+- Quadratic cost with sequence length limits context size. Many variants address this:
+  - Sparse attention patterns (Longformer, BigBird) limit attention to local windows, global tokens, or sampled tokens.
+  - Low-rank approximations / linearized attention (Linformer, Performer) approximate QK^T to reduce cost.
+  - Memory/recurrence mechanisms (Transformer‑XL, Compressive Transformers) provide longer effective context by caching compressed past states.
+  - Reformer uses locality-sensitive hashing to approximate attention more cheaply.
+- Choice of variant depends on trade-offs between full-context modeling and computational constraints.
+
+10. Why attention works well for sequence processing
+- Direct pairwise interactions: every token can attend to any other token, enabling direct modeling of long-range dependencies without intermediate steps.
+- Dynamic, content-based routing: attention weights depend on token content, not position alone.
+- Parallel computation: entire sequences can be processed simultaneously, accelerating training.
+- Composability: attention layers combine naturally with feed-forward layers, residual connections, and normalization to form deep, expressive models.
+
+11. Practical implementation notes
+- Typical transformer implementations use:
+  - d_model (hidden size), H heads, d_k = d_model / H.
+  - Linear projection matrices W_Q, W_K, W_V (size d_model × d_k), and W_O (size (H·d_k) × d_model).
+  - Layer normalization and residual connections to stabilize training.
+  - Dropout applied to attention weights and feed-forward outputs for regularization.
+- Training often uses teacher forcing for autoregressive models; inference uses cached keys/values to avoid recomputing attention over the entire history for each generated token.
+
+Summary
+Attention in transformers converts sequences into contextualized representations by computing content-based weighted sums of values, using queries and keys to determine relevance. Scaled dot-product attention and multi-head attention provide the mathematical and architectural forms that let transformers model complex, long-range relationships while benefiting from parallel computation. Positional encodings supply order information; masking enables autoregressive generation; and various extensions mitigate quadratic scaling to handle longer contexts. Together, these elements make attention the central mechanism enabling transformers to process sequences effectively across a wide range of tasks.
