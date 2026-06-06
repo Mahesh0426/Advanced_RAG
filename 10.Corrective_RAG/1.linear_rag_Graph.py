@@ -1,6 +1,4 @@
 from typing import List, TypedDict
-from pydantic import BaseModel
-import time
 import os
 
 from langchain_community.document_loaders import PyPDFLoader
