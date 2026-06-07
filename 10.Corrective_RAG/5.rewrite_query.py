@@ -5,6 +5,7 @@ import os
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
+from langchain_community.retrievers import TavilySearchAPIRetriever
 from langchain_openai import OpenAIEmbeddings,ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
@@ -59,11 +60,11 @@ class State(TypedDict):
     strips: List[str]  #the raw text chunks extracted from retrieved docs, broken down into smaller pieces (strips)
     kept_strips: List[str] # after a relevance grading step, only the strips that are relevant to the question survive here
     refined_context: List[str] # after a rewriting or refinement step, improved strips are stored here
-
+    web_search:List[Document] # web results fetched by Tavily when verdict is INCORRECT or AMBIGUOUS
     answer:str
+    web_query:str
 
-# ==========1st NODE===========
-# 6. Retrieve node - It takes the question from the state and returns the retrieved chunks.
+# 6. Retrieve node - 1st NODE. It takes the question from the state and returns the retrieved chunks.
 def retrieve(state):
     print("\n--- retrieve node ---")
     q=state["question"]
@@ -94,8 +95,7 @@ doc_eval_prompt = ChatPromptTemplate.from_messages([
 # chains prompt → LLM → parsed DocEvalScore object
 doc_eval_chain = doc_eval_prompt | llm.with_structured_output(DocEvalScore)
 
-#==========2nd NODE=============
-#8. Doc-level filtering node - it scores each chunk individually
+#8. Doc-level filtering node - 1st node 
 def eval_each_doc_node(state:State)->State:
     print("\n--- eval each doc node ---")
     q=state["question"]
@@ -115,8 +115,8 @@ def eval_each_doc_node(state:State)->State:
         if out.score > LOWER_TH:
             good_doc.append(doc)
     
-    # ----2.CORRECT if at least one doc > UPPER_TH----
-    if any(s > UPPER_TH for s in scores): # Go through every score in the list one by one — if even a single score is above 0.7, stop immediately and return True.
+    # ----2.CORRECT if al least one doc > UPPER_TH----
+    if any(s > UPPER_TH for s in scores): # "Go through every score in the list one by one — if even a single score is above 0.7, stop immediately and return True.
         return{
             "good_docs":good_doc,
             "verdict":"CORRECT",
@@ -167,15 +167,17 @@ firter_prompt = ChatPromptTemplate.from_messages([
 # Chains the prompt → LLM → structured output parser in one callable.
 filter_chain = firter_prompt | llm.with_structured_output(KeepOrDrop) 
 
-#==========3rd NODE================
-#11. refining (decompose - filter - recompose)- it refine docs and take only relevant 
+#11. refining 2nd NODE. (decompose - filter - recompose)
 def refine(state: State)-> State:
     print("\n--- refine node ---")
     q = state["question"]
     print("Question:", q)
     
-    #combine retrieved docs into one context string
-    context = "\n\n".join(d.page_content for d in state["good_docs"]).strip()
+    if state.get("verdict") == "CORRECT":
+        #combine retrieved docs into one context string
+        context = "\n\n".join(d.page_content for d in state["good_docs"]).strip()
+    else:
+       context = " \n\n".join(d.page_content for d in state["web_search"]).strip()
     
     # ── Stage 1: DECOMPOSE ────────────────────────────────────────────────────
     # Split the merged context into individual sentences.
@@ -200,7 +202,51 @@ def refine(state: State)-> State:
         "refined_context":refined_context # final clean context for generation
     }
 
+class WebQuery(BaseModel):
+    query:str
 
+rewrite_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "rewrite the user question into a web search query composed of keywords.\n"
+     "Rules:\n"
+     "- keep it short (6-14 words).\n"
+     "- If the question implies a recency, (for example, recents/latest/last month), add a constant like,in last 30 days.\n"
+     "- Do NOT answer the question.\n"
+     "- Return JSON with a single key: query."
+     ),
+    ("human", "Question: {question}")
+])
+rewrite_chain = rewrite_prompt | llm.with_structured_output(WebQuery)
+
+
+#Rewrite query node
+def rewrite_query_node(state:State)->State:
+    print("\n--- rewrite query node ---")
+    out = rewrite_chain.invoke({"question": state["question"]})
+    print("Rewritten Query:", out.query)
+    return {"web_query": out.query}
+
+
+# Web search node  - 3rd node
+tavily = TavilySearchAPIRetriever(max_results=5)
+
+def web_search_node(state:State)->State:
+    print("\n--- web search node ---")
+    q=state.get("web_query") or state["question"]
+    print("Web Query:", q)
+    results = tavily.invoke(q)
+    print("\n Web Search Results\n")
+    print(results)
+    
+    web_docs = []
+    for r in results or []:
+        url = r.metadata.get("url", "")
+        title = r.metadata.get("title", "")
+        text = f"TITLE: {title}\nURL: {url}\nCONTENT: {r.page_content}\n\n"
+        web_docs.append(Document(page_content=text, metadata={"url": url, "title": title}))
+    return{"web_search":web_docs}
+    
+        
 #Prompt for the final generation step.
 answer_prompt = ChatPromptTemplate.from_messages([
     ("system",
@@ -210,21 +256,13 @@ answer_prompt = ChatPromptTemplate.from_messages([
     ("human", "Question: {question}\n\nRefined context:\n{refined_context}")
 ])
 
-#==========4th NODE================
-#12. generate node - it use the final refined context and produce the final answer
+#12. generate node - 4th NODE
 def generate(state:State)->State:
    print("\n--- generate node ---")
    out = (answer_prompt | llm).invoke({"question":state["question"],"refined_context":state["refined_context"]})
    return{"answer" : out.content}
 
-
-#==========5th NODE================
-#fail_node
-def fail_node(state:State)->State:
-    return{ "answer":f"FAIL: {state['reason']}"}
-
-#==========6th NODE================
-#ambiguous_node
+#ambiguous_node 5th node
 def ambiguous_node(state:State)->State:
     return{ "answer":f"AMBIGUOUS: {state['reason']}"}
 
@@ -233,18 +271,19 @@ def route_after_eval(state:State)->str:
     if state["verdict"] == "CORRECT":
         return "refine"
     elif state["verdict"] == "INCORRECT":
-        return "fail"
+        return "rewrite_query"
     else:
         return "ambiguous"
 
     
-# 11. build the RAG graph - START → retrieve → eval_each_doc → route_after_eval→ refine → generate → END
+# 11. build the RAG graph - START → retrieve →refine → generate → END
 g = StateGraph(State)
 g.add_node("retrieve",retrieve)
 g.add_node("eval_each_doc",eval_each_doc_node)
+g.add_node("rewrite_query",rewrite_query_node)
+g.add_node("web_search",web_search_node)
 g.add_node("refine",refine)
 g.add_node("generate",generate)
-g.add_node("fail",fail_node)
 g.add_node("ambiguous",ambiguous_node)
 
 
@@ -255,25 +294,30 @@ g.add_conditional_edges(
     route_after_eval,
     {
         "refine": "refine",
-        "fail": "fail",
+        "rewrite_query": "rewrite_query",
+        "web_search": "web_search",
         "ambiguous": "ambiguous"
     }
 )
+#INCORRECT path : re-write -> web_search -> refine -> generate
+g.add_edge("rewrite_query","web_search")
+g.add_edge("web_search","refine")
 g.add_edge("refine","generate")
 g.add_edge("generate",END)
-g.add_edge("fail",END)
+g.add_edge("ambiguous",END)
 
 
 workflow = g.compile()
 
 res = workflow.invoke({
-    "question":"how does corrective rag works?",
+    "question":"Latest news about quantum computing breakthroughs",
     "docs":[],
     "good_docs":[],
     "verdict":[],
     "reason":[],
     "strips": [],
     "kept_strips" :[],
+    "web_search":[],
     "refined_context":"",
     "answer": ""
     })
@@ -284,6 +328,8 @@ print("\nREASON:", res["reason"])
 print("\n-------Final answer: ------")
 print(res["answer"])
 
+print("\n re-written query:")
+print(res.get("web_query", "N/A (verdict was not INCORRECT, rewrite not triggered)"))
 
 # print("\n--- All strips ---")
 # for i, strip in enumerate(res["strips"], 1):
