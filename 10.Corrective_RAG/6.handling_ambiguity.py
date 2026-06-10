@@ -178,13 +178,10 @@ def refine(state: State)-> State:
     print("Question:", q)
     
     if state.get("verdict") == "CORRECT":
-        docs_to_use = state["good_docs"]
-    elif state.get("verdict") == "INCORRECT":
-         docs_to_use = state["web_search"]
-    else: #AMBIGIOUS
-         docs_to_use = state["good_docs"] + state["web_search"]
-    
-    context = "\n\n".join(d.page_content for d in docs_to_use).strip()
+        #combine retrieved docs into one context string
+        context = "\n\n".join(d.page_content for d in state["good_docs"]).strip()
+    else:
+       context = " \n\n".join(d.page_content for d in state["web_search"]).strip()
     
     # ── Stage 1: DECOMPOSE ────────────────────────────────────────────────────
     # Split the merged context into individual sentences.
@@ -209,7 +206,6 @@ def refine(state: State)-> State:
         "refined_context":refined_context # final clean context for generation
     }
 
-# web query re-writw for web search
 class WebQuery(BaseModel):
     query:str
 
@@ -245,7 +241,7 @@ def web_search_node(state:State)->State:
     print("\n Web Search Results\n")
     print(results)
     
-    web_docs:List[Document]    = []
+    web_docs = []
     for r in results or []:
         url = r.metadata.get("url", "")
         title = r.metadata.get("title", "")
@@ -269,13 +265,19 @@ def generate(state:State)->State:
    out = (answer_prompt | llm).invoke({"question":state["question"],"refined_context":state["refined_context"]})
    return{"answer" : out.content}
 
+# =========== 7th NODE ===========
+#ambiguous_node - it will return the answer if the verdict is AMBIGUOUS.
+def ambiguous_node(state:State)->State:
+    return{ "answer":f"AMBIGUOUS: {state['reason']}"}
+
 #the routing function -  decides where the flow should go next
 def route_after_eval(state:State)->str:
     if state["verdict"] == "CORRECT":
         return "refine"
-    else:
+    elif state["verdict"] == "INCORRECT":
         return "rewrite_query"
-   
+    else:
+        return "ambiguous"
 
     
 # 11. build the RAG graph - START ->retrieve -> eval_each_doc -> refine → generate → END
@@ -286,7 +288,7 @@ g.add_node("rewrite_query",rewrite_query_node)
 g.add_node("web_search",web_search_node)
 g.add_node("refine",refine)
 g.add_node("generate",generate)
-
+g.add_node("ambiguous",ambiguous_node)
 
 
 g.add_edge(START,"retrieve")
@@ -297,6 +299,8 @@ g.add_conditional_edges(
     {
         "refine": "refine",
         "rewrite_query": "rewrite_query",
+        "web_search": "web_search",
+        "ambiguous": "ambiguous"
     }
 )
 #INCORRECT path : re-write -> web_search -> refine -> generate
@@ -304,13 +308,13 @@ g.add_edge("rewrite_query","web_search")
 g.add_edge("web_search","refine")
 g.add_edge("refine","generate")
 g.add_edge("generate",END)
-
+g.add_edge("ambiguous",END)
 
 
 workflow = g.compile()
 
 res = workflow.invoke({
-    "question":"What specific GPU models were used to measure FLOPs in the CRAG evaluation",
+    "question":"Latest news about quantum computing breakthroughs",
     "docs":[],
     "good_docs":[],
     "verdict":[],
