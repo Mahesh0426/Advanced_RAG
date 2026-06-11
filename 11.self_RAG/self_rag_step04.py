@@ -21,24 +21,24 @@ pdf_path2 = documents_dir / "Company_Profile.pdf"
 pdf_path3 = documents_dir / "Product_and_Pricing.pdf"
 
 # 1. Load the PDF
-docs: List = (
+docs:List = (
     PyPDFLoader(str(pdf_path1)).load()
     + PyPDFLoader(str(pdf_path2)).load()
-    + PyPDFLoader(str(pdf_path3)).load()
-)
+    +  PyPDFLoader(str(pdf_path3)).load()
+    )
 print(f"Loaded {len(docs)} page(s) from the PDF.")
 
-# 2. Split Documents into chunks
-chunks = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=150).split_documents(docs)
+# 2. Split documents into chunks
+chunks  = RecursiveCharacterTextSplitter(chunk_size=600,chunk_overlap=150).split_documents(docs)
 print(f"\nSplit into {len(chunks)} chunks.")
 
 # 3. Embeddings & Vector Store
-embedding = OpenAIEmbeddings(model="text-embedding-3-large")
-vector_store = FAISS.from_documents(chunks, embedding)
+embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+vector_store = FAISS.from_documents(chunks, embeddings)
 print("\nVector store created successfully.")
 
 # 4. Create Retriever
-retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+retriever = vector_store.as_retriever(search_type="similarity",search_kwargs={"k":4})
 print("\nRetriever created successfully.")
 
 # 5. Define the LLM
@@ -53,17 +53,22 @@ class State(TypedDict):
     relevant_docs:List[Document]
     answer:str
     context: str
-
-
+    
+    #post-geberation verification
+    issup:Literal["fully_supported", "partially_supported","not_supported"]
+    evidence:List[str]
+    
+    
+# ======= 1st Node=======  
 # Pydantic schema that defines the exact JSON structure the LLM must return.
-# Inheriting from BaseModel enables automatic type validation and JSON schema
+# Inheriting from BaseModel enables automatic type validation and JSON schema   
 class RetrieveDecision(BaseModel):
-    should_retrieve:bool = Field(
+     should_retrieve:bool = Field(
         ...,
         description="True if external documents are needed to answer reliably ,else False"
         )
 
-# prompt template for decide retrieval node
+ # prompt template for decide retrieval node
 decide_retrieval_prompt = ChatPromptTemplate(
         [
             (
@@ -78,24 +83,23 @@ decide_retrieval_prompt = ChatPromptTemplate(
         ),
         ("human", "Question: {question}"),
         ]
-    )
+    )   
 
 # create llm with structured output - this is used to get the JSON output from the LLM
 should_retrieve_llm = llm.with_structured_output(RetrieveDecision)
 
-# ======= 1st Node=======
-# 6.decide_retrieval - it decides whether to retrieve documents or not
+# 6.decide_retrieval_node - it decides whether to retrieve documents or not
 def decide_retrieval_node(state: State) -> State:
     """1st node: decide retrieval need."""
-    decision: RetrieveDecision = should_retrieve_llm.invoke(
+    decision:RetrieveDecision = should_retrieve_llm.invoke(
         decide_retrieval_prompt.format_messages(question=state["question"])
     )
-    
     print("\nRetrieval needed:", decision.should_retrieve)
-    return {"need_retrieve":decision.should_retrieve}
-
-
-# prompt template for direct generation node
+    return {"need_retrieve": decision.should_retrieve}
+    
+    
+# ======= 2nd Node=======
+ # prompt template for direct generation node
 direct_generation_prompt = ChatPromptTemplate(
     [
         (
@@ -107,10 +111,9 @@ direct_generation_prompt = ChatPromptTemplate(
         ),
         ("human", "{question}"),
     ]
-)
+)   
 
-# ======= 2nd Node======= 
-# 8. geberate_direct - Answer directly without retrieval
+# 7. generate_direct_node - Answer directly without retrieval
 def generate_direct_node(state: State) -> State:
     """2nd node: Answer directly without retrieval."""
     out = llm.invoke(
@@ -120,7 +123,7 @@ def generate_direct_node(state: State) -> State:
     )
     return {
         "answer": out.content
-    }
+    }  
 
 # ======= 3rd Node======= 
 # 9. retrieve node - it retrieves documents from the vector store
@@ -130,12 +133,16 @@ def retrieve_node(state: State) -> State:
     print(f"Retrieved {len(docs)} chunks.\n")
     return {"docs": docs}
 
+
+# ======= 4th Node======= 
 # Pydantic schema that defines the exact JSON structure the LLM must return.
 class RelevanceDecision (BaseModel):
     is_relevant:bool = Field(
         ...,
         description="True if the document helps answer the question ,else False"
     )
+    
+ # prompt template for relevance check node
 is_relevant_prompt = ChatPromptTemplate.from_messages(
     [
      (
@@ -153,7 +160,6 @@ is_relevant_prompt = ChatPromptTemplate.from_messages(
 )
 relevance_llm = llm.with_structured_output(RelevanceDecision)
 
-# ======= 4th Node======= 
 # 10. is_relevant_node - it checks the relevance of the retrieved documents
 def is_relevant_node(state: State):
     
@@ -172,6 +178,8 @@ def is_relevant_node(state: State):
 
     return {"relevant_docs": relevant_docs}
 
+
+# ======= 5th Node====== 
 rag_generation_prompt = ChatPromptTemplate.from_messages(
     [
         (
@@ -190,8 +198,7 @@ rag_generation_prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
- # ======= 5th Node =======
- # generate_from_context - it generates the answer from the relevant documents
+ #11. generate_from_context_node - it generates the answer from the relevant documents
 def generate_from_context_node(state: State):
     # Stuff relevant docs into one block
     context = "\n\n---\n\n".join(
@@ -209,13 +216,71 @@ def generate_from_context_node(state: State):
     )
     return {"answer": out.content, "context": context}
 
- # ======= 6th Node =======
- # 12. no_relevant_docs - it handles the case where no relevant documents are found
-def no_relevant_docs_node(state: State):
-    return {"answer": "No relevant document found.", "context": ""}
 
-# ======= The conditional router (routing finction) =====
-# 13.route_after_decide - It decides which node to call next based on the retrieval decision.
+ # ======= 6th Node =======
+ # 12. no_answer_found - it handles the case where no answer is found
+def no_answer_found_node(state: State):
+    return {"answer": "No answer found.", "context": ""}
+
+
+# ======= 7th Node====== 
+# IsSup verify + revise loop
+
+# Pydantic schema that defines the exact JSON structure the LLM must return.
+class IsSUPDecision(BaseModel):
+    issup:Literal['fully_supported','partially_supported','not_supported']
+    evidence:List[str] = Field(default_factory=list)
+    
+ # is_sup_prompt
+issup_prompt = ChatPromptTemplate.from_messages(
+     [
+         (
+            "system",
+            "You are verifying whether the ANSWER is supported by the CONTEXT.\n"
+            "Return JSON with keys: issup, evidence.\n"
+            "issup must be one of: fully_supported, partially_supported, no_support.\n\n"
+            "How to decide issup:\n"
+            "- fully_supported:\n"
+            "  Every meaningful claim is explicitly supported by CONTEXT, and the ANSWER does NOT introduce\n"
+            "  any qualitative/interpretive words that are not present in CONTEXT.\n"
+            "  (Examples of disallowed words unless present in CONTEXT: culture, generous, robust, designed to,\n"
+            "  supports professional development, best-in-class, employee-first, etc.)\n\n"
+            "- partially_supported:\n"
+            "  The core facts are supported, BUT the ANSWER includes ANY abstraction, interpretation, or qualitative\n"
+            "  phrasing not explicitly stated in CONTEXT (e.g., calling policies 'culture', saying leave is 'generous',\n"
+            "  or inferring outcomes like 'supports professional development').\n\n"
+            "- no_support:\n"
+            "  The key claims are not supported by CONTEXT.\n\n"
+            "Rules:\n"
+            "- Be strict: if you see ANY unsupported qualitative/interpretive phrasing, choose partially_supported.\n"
+            "- If the answer is mostly unrelated to the question or unsupported, choose no_support.\n"
+            "- Evidence: include up to 3 short direct quotes from CONTEXT that support the supported parts.\n"
+            "- Do not use outside knowledge."
+        ),
+        (
+            "human",
+            "Question:\n{question}\n\n"
+            "Answer:\n{answer}\n\n"
+            "Context:\n{context}\n"
+        ),
+         
+     ]
+ )
+issup_llm = llm.with_structured_output(IsSUPDecision)
+
+# 13. is_supported_node - it checks the support level of the answer
+def is_sup_node(state:State):
+    decision:IsSUPDecision = issup_llm.invoke(
+        issup_prompt.format_messages(
+            question = state["question"],
+            answer=state.get("answer", ""),
+            context=state.get("context", ""),
+        )
+    )
+    return {"issup":decision.issup, "evidence":decision.evidence}
+    
+# ======= The conditional router (routing function) =====
+# 14.route_after_decide - It decides which node to call next based on the retrieval decision.
 def route_after_decide(state: State) -> Literal["generate_direct","retrieve"]:
     """4th node: Conditional router. Decide next node based on retrieval decision."""
     if state["need_retrieve"]:
@@ -226,24 +291,27 @@ def route_after_decide(state: State) -> Literal["generate_direct","retrieve"]:
         return "generate_direct"
 
 # 14.route_after_relevance - It decides which node to call next based on the relevance decision.
-def route_after_relevance(state: State) -> Literal["generate_from_context", "no_relevant_docs"]:
+def route_after_relevance(state: State) -> Literal["generate_from_context", "no_answer_found"]:
     if state.get("relevant_docs") and len(state["relevant_docs"]) > 0:
         return "generate_from_context"
-    return "no_relevant_docs"
+    return "no_answer_found"
 
-# 14. build the RAG graph 
+# ============================================================
+
+# 15. build the RAG graph 
 g = StateGraph(State)
 
-# 15. add nodes to the graph
+# 16. add nodes to the graph
 g.add_node("decide_retrieval",decide_retrieval_node)
 g.add_node("generate_direct",generate_direct_node)
 g.add_node("retrieve",retrieve_node)
 g.add_node("is_relevant",is_relevant_node)
 g.add_node("generate_from_context",generate_from_context_node)
-g.add_node("no_relevant_docs",no_relevant_docs_node)
+g.add_node("no_answer_found",no_answer_found_node)
+g.add_node("is_sup",is_sup_node) #✅ NEW nodes
 
 
-#16. edges
+#17. edges
 g.add_edge(START,"decide_retrieval")
 g.add_conditional_edges(
     "decide_retrieval",route_after_decide,
@@ -258,70 +326,63 @@ g.add_conditional_edges(
     "is_relevant",route_after_relevance,
     {
         "generate_from_context":"generate_from_context",
-        "no_relevant_docs":"no_relevant_docs"
+        "no_answer_found":"no_answer_found"
     }
 )
-g.add_edge("generate_from_context",END)
-g.add_edge("no_relevant_docs",END)
+#if no answer found end
+g.add_edge("no_answer_found",END)
+#if generated from context, verify with IsSUP loop
+g.add_edge("generate_from_context","is_sup")
+g.add_edge("is_sup",END)
 
 
 workflow = g.compile()   
 png_data = workflow.get_graph().draw_mermaid_png()
-with open("self_rag_step02.png", "wb") as f:
+with open("self_rag_step04.png", "wb") as f:
     f.write(png_data)
 print("Graph saved successfully!")
 
-result = workflow.invoke({
-    "question":"who is CEO of Nexa AI ?",
-    "need_retrieve":False,
-    "docs": [],
-    "answer": ""
-    })
 
-print("\n" + "="*80)
-print("TEST CASE 1: With document-dependent question\n")
-print("\n" + "checking need retrieval:")
-print(result["need_retrieve"])
-print(result["answer"])
+result = workflow.invoke(
+        {
+            # "question": 'How many employs does NexaAI have"?',
+            "question": 'describe NexaAI company culture"?',
+            "docs": [],
+            "relevant_docs": [],
+            "context": "",
+            "answer": "",
+            "issup": "",
+            "evidence": [],
+        },
+    )
+    
+print(f"\nQuestion: {result.get('question')}")
+print("\nneed_retrieval:", result.get("need_retrieval"))
+print("\n#docs:", len(result.get("docs", [])))
+print("\n#relevant_docs:", len(result.get("relevant_docs", [])))
+print("\nissup:", result.get("issup"))
+print("\nevidence:", result.get("evidence"))
+print("\nanswer:", result.get("answer"))
 
+    
+result2 = workflow.invoke(
+        {
+            "question": 'Do NexaAI plans include a free trial? If yes, how many days?',
+            "docs": [],
+            "relevant_docs": [],
+            "context": "",
+            "answer": "",
+            "issup": "",
+            "evidence": [],
+        },
+    )
+    
+print(f"\nQuestion: {result2.get('question')}")
+print("\nneed_retrieval:", result2.get("need_retrieval"))
+print("\n#docs:", len(result2.get("docs", [])))
+print("\n#relevant_docs:", len(result2.get("relevant_docs", [])))
+print("\nissup:", result2.get("issup"))
+print("\nevidence:", result2.get("evidence"))
+print("\nanswer:", result2.get("answer"))
 
-
-print("\n" + "relevant docs: ")
-for doc in result['relevant_docs']:
-    print(doc.page_content)
-    print("*"*100)
-
-# ================== 2nd test case =================
-print("\n" + "="*80)
-print("TEST CASE 2: With general knowledge question\n")
-result = workflow.invoke({"question":"What is the refund policy of NexaAI"})
-
-print("\n" + "checking need retrieval:")
-print(result["need_retrieve"])
-
-print("\n--- Final Answer ---")
-print(result["answer"])
-
-
-
-# print("\n" + "checking docs")
-# print(result["docs"])
-
-# START
-# │
-# ▼
-# decide_retrieval
-# │
-# ▼
-# route_after_decide
-# │
-# ├───────────────────────────────┐
-# │                               │
-# ▼                               ▼
-# generate_direct               retrieve
-# │                               │
-# ▼                               ▼
-# END                        is_relevant
-#                                 │
-#                                 ▼
-#                                 END
+    
