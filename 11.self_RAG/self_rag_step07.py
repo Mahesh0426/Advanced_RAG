@@ -24,9 +24,9 @@ pdf_path3 = documents_dir / "Product_and_Pricing.pdf"
 docs:List = (
     PyPDFLoader(str(pdf_path1)).load()
     + PyPDFLoader(str(pdf_path2)).load()
-    +  PyPDFLoader(str(pdf_path3)).load()
-    )
-print(f"Loaded {len(docs)} page(s) from the PDF.")
+    + PyPDFLoader(str(pdf_path3)).load()
+)
+print(f"Loaded {len(docs)} pages(s) from the PDF.")
 
 # 2. Split documents into chunks
 chunks  = RecursiveCharacterTextSplitter(chunk_size=600,chunk_overlap=150).split_documents(docs)
@@ -35,34 +35,36 @@ print(f"\nSplit into {len(chunks)} chunks.")
 # 3. Embeddings & Vector Store
 embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
 vector_store = FAISS.from_documents(chunks, embeddings)
-print("\nVector store created successfully.")
+print("\nVector store created successfully...")
 
 # 4. Create Retriever
 retriever = vector_store.as_retriever(search_type="similarity",search_kwargs={"k":4})
-print("\nRetriever created successfully.")
+print("\nRetriever created successfully...")
 
 # 5. Define the LLM
 llm = ChatOpenAI(model="gpt-4o-mini",temperature=0)
-print("\nLLM created successfully.")
+print("\nLLM created successfully...")
 
 #5. Graph state - it is the shared memory that flows through the entire StateGraph. Every node reads from it and writes to it
 class State(TypedDict):
-    question:str
-    need_retrieve:bool
-    docs:List[Document]
-    relevant_docs:List[Document]
-    answer:str
-    context: str
-    
-    #post-geberation verification
-    issup:Literal["fully_supported", "partially_supported","not_supported"]
-    evidence:List[str]
-    
-    retries:int
-    # ✅ NEW: usefulness check
-    isuse: Literal["useful", "not_useful"]
-    use_reason: str
-    
+        question:str
+        need_retrieve:bool
+        docs:List[Document]
+        relevant_docs:List[Document]
+        answer:str
+        context: str
+        #post-geberation verification
+        issup:Literal["fully_supported", "partially_supported","not_supported"]
+        evidence:List[str]
+        retries:int
+        isuse: Literal["useful", "not_useful"]
+        use_reason: str
+        
+        # ✅ NEW: what we actually send to vector retriever
+        retrieval_query: str
+        rewrite_tries: int
+
+
 # ======= 1st Node=======  
 # Pydantic schema that defines the exact JSON structure the LLM must return.
 # Inheriting from BaseModel enables automatic type validation and JSON schema   
@@ -98,7 +100,7 @@ def decide_retrieval_node(state: State) -> State:
     decision:RetrieveDecision = should_retrieve_llm.invoke(
         decide_retrieval_prompt.format_messages(question=state["question"])
     )
-    print("\nRetrieval needed:", decision.should_retrieve)
+    print("\nIs Retrieval needed:", decision.should_retrieve)
     return {"need_retrieve": decision.should_retrieve}
 
 
@@ -127,15 +129,18 @@ def generate_direct_node(state: State) -> State:
     )
     return {
         "answer": out.content
-    }  
-
+    } 
+    
+    
 # ======= 3rd Node======= 
 # 9. retrieve node - it retrieves documents from the vector store
 def retrieve_node(state: State) -> State:
     """3rd node: Retrieve documents from vector store."""
-    docs: List[Document] = retriever.invoke(state["question"])
-    print(f"Retrieved {len(docs)} chunks.\n")
+    q=state.get("retrieval_query") or state["question"]
+    docs=retriever.invoke(q)
+    print(f"\nRetrieved {len(docs)} chunks.\n")
     return {"docs": docs}
+
 
 # ======= 4th Node======= 
 # Pydantic schema that defines the exact JSON structure the LLM must return.
@@ -145,7 +150,7 @@ class RelevanceDecision (BaseModel):
         description="True if the document helps answer the question ,else False"
     )
 
- # prompt template for relevance check node
+# prompt template for relevance check node
 is_relevant_prompt = ChatPromptTemplate.from_messages(
     [
      (
@@ -181,7 +186,8 @@ def is_relevant_node(state: State):
 
     return {"relevant_docs": relevant_docs}
 
-# ======= 5th Node====== 
+
+# ======= 5th Node======= 
 rag_generation_prompt = ChatPromptTemplate.from_messages(
     [
         (
@@ -200,7 +206,6 @@ rag_generation_prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
- 
 #11. generate_from_context_node - it generates the answer from the relevant documents
 def generate_from_context_node(state: State):
     # Stuff relevant docs into one block
@@ -219,10 +224,12 @@ def generate_from_context_node(state: State):
     )
     return {"answer": out.content, "context": context}
 
+
 # ======= 6th Node =======
  # 12. no_answer_found - it handles the case where no answer is found
 def no_answer_found_node(state: State):
     return {"answer": "No answer found.", "context": ""}
+
 
 # ======= 7th Node====== 
 # IsSup verify + revise loop
@@ -231,7 +238,7 @@ class IsSUPDecision(BaseModel):
     issup:Literal['fully_supported','partially_supported','not_supported']
     evidence:List[str] = Field(default_factory=list)
     
- # is_sup_prompt
+# is_sup_prompt
 issup_prompt = ChatPromptTemplate.from_messages(
      [
          (
@@ -266,10 +273,9 @@ issup_prompt = ChatPromptTemplate.from_messages(
          
      ]
  )
-
 issup_llm = llm.with_structured_output(IsSUPDecision)
 
-# 13. is_supported_node - it checks the support level of the answer
+# 13. is_supported_node - it checks the support level of the answer | it find  hallucination
 def is_sup_node(state:State):
     decision:IsSUPDecision = issup_llm.invoke(
         issup_prompt.format_messages(
@@ -279,6 +285,7 @@ def is_sup_node(state:State):
         )
     )
     return {"issup":decision.issup, "evidence":decision.evidence}
+
 
 # ======== 8th Node====== 
 # 14. accept_answer_node - It accepts the answer as it is.
@@ -319,11 +326,11 @@ def revise_answer_node(state: State):
             context=state.get("context", ""),
         )
     )
+    
     return {
         "answer": out.content,
         "retries": state.get("retries", 0) + 1,  # ✅ increment
     }
-   
    
    
 # ======== 10th Node======  
@@ -332,6 +339,7 @@ class IsUSEDecision(BaseModel):
     isuse: Literal["useful", "not_useful"]
     reason: str = Field(..., description="Short reason in 1 line.")
 
+# prompt template for usefulness check node
 isuse_prompt = ChatPromptTemplate.from_messages(
     [
         (
@@ -367,10 +375,65 @@ def is_use_node(state: State):
     return {"isuse": decision.isuse, "use_reason": decision.reason}
 
 
+# ======== 11th Node====== 
+class RewriteDecision(BaseModel):
+    retrieval_query:str = Field(
+        ...,
+        description="Rewritten query optimized for vector retrieval, against internal company PDFs."
+    )
+    
+rewrite_for_retrieval_prompt = ChatPromptTemplate.from_messages(
+    [
+        
+        (
+            "system",
+            "Rewrite the user's QUESTION into a query optimized for vector retrieval over INTERNAL company PDFs.\n\n"
+            "Rules:\n"
+            "- Keep it short (6–16 words).\n"
+            "- Preserve key entities (e.g., NexaAI, plan names).\n"
+            "- Add 2–5 high-signal keywords that likely appear in policy/pricing docs.\n"
+            "- Remove filler words.\n"
+            "- Do NOT answer the question.\n"
+            "- Output JSON with key: retrieval_query\n\n"
+            "Examples:\n"
+            "Q: 'Do NexaAI plans include a free trial?'\n"
+            "-> {{'retrieval_query': 'NexaAI free trial duration trial period plans'}}\n\n"
+            "Q: 'What is NexaAI refund policy?'\n"
+            "-> {{'retrieval_query': 'NexaAI refund policy cancellation refund timeline charges'}}"
+        ),
+        (
+            "human",
+            "QUESTION:\n{question}\n\n"
+            "Previous retrieval query:\n{retrieval_query}\n\n"
+            "Answer (if any):\n{answer}"
+        ),
+    ]
+)
+rewrite_llm = llm.with_structured_output(RewriteDecision)
+
+# rewrite_question_node - it rewrite the question optimized for vector retrieval
+def rewrite_question_node(state:State):
+    decision:RewriteDecision = rewrite_llm.invoke(
+        rewrite_for_retrieval_prompt.format_messages(
+            question=state["question"],
+            retrieval_query=state.get("retrieval_query", ""),
+            answer=state.get("answer", "")
+        )
+        
+    )
+    return{
+        "retrieval_query":decision.retrieval_query,
+        "rewrite_tries": state.get("rewrite_tries", 0) + 1,
+        # optional 
+        "docs":[],
+        "relevant_docs":[],
+        "context":"",
+    }
+    
+
+
 # ======= 16. The conditional ROUTER (routing function) =====
-
 MAX_RETRIES = 10
-
 # 16.a route_after_issup - It decides which node to call next based on the support level of the answer.
 def route_after_issup(state: State) -> Literal["accept_answer", "revise_answer"]:
     if state.get("issup") == "fully_supported":
@@ -403,7 +466,6 @@ def route_after_isuse(state: State) -> Literal["END", "no_answer_found"]:
 
 # ============================================================
 
-
 # 17. build the RAG graph 
 g = StateGraph(State)
 
@@ -417,7 +479,8 @@ g.add_node("no_answer_found",no_answer_found_node)
 g.add_node("is_sup",is_sup_node)
 g.add_node("accept_answer", accept_answer_node) 
 g.add_node("revise_answer", revise_answer_node) 
-g.add_node("is_use", is_use_node) # ✅ NEW: IsUSE + finalize
+g.add_node("is_use", is_use_node) 
+g.add_node("rewrite_question",rewrite_question_node) # ✅ NEW: re-write question for better retrieval
 
 #19. edges
 g.add_edge(START, "decide_retrieval")
@@ -430,9 +493,9 @@ g.add_conditional_edges(
     },
 )
 g.add_edge("generate_direct", END)
-g.add_edge("retrieve", "is_relevant")
 
-# Add edges for the relevance router
+# retrieve --> relevance --> (generate_from_context | no_answer_found)
+g.add_edge("retrieve", "is_relevant")
 g.add_conditional_edges(
     "is_relevant", route_after_relevance,
     {
@@ -442,7 +505,8 @@ g.add_conditional_edges(
 )
 # If no answer found, end
 g.add_edge("no_answer_found", END)
-# Verify → (accept | revise) → verify loop
+
+ # Generate -> IsSUP -> (IsUSE | revise) loop
 g.add_edge("generate_from_context", "is_sup")
 g.add_conditional_edges(
     "is_sup", route_after_issup,  # fully_supported -> accept_answer else revise_answer
@@ -454,20 +518,25 @@ g.add_conditional_edges(
 # revise then re-check support
 g.add_edge("revise_answer", "is_sup")  # 🔁 loop back to verify
 #  IsUSE routing
+# useful --> END ,  not_useful --> rewrite_question --> retrieve ... loop
+# give_up --> no_answer_found --> END
 g.add_conditional_edges(
     "is_use", route_after_isuse, # useful -> END else no_answer_found
     {
         "END": END,
+        "rewrite_question": "rewrite_question",
         "no_answer_found": "no_answer_found",
     },
 )
+# rewrite -> retrieve -> relevance -> ...
+g.add_edge("rewrite_question", "retrieve")
 
 
 
 
 workflow = g.compile()   
 png_data = workflow.get_graph().draw_mermaid_png()
-with open("self_rag_step06.png", "wb") as f:
+with open("self_rag_step07.png", "wb") as f:
     f.write(png_data)
 print("Graph saved successfully!")
 
@@ -475,6 +544,8 @@ result = workflow.invoke(
     {
         # "question": "What is refund policy of NexaAI.",
         "question": "Describe NexaAI’s company culture.",
+        "retrieval_query": "What is the refund policy of NexaAI.",
+        "rewrite_tries":0,
         "docs": [],
         "relevant_docs": [],
         "context": "",
@@ -482,37 +553,59 @@ result = workflow.invoke(
         "issup": "",
         "evidence": [],
         "retries": 0,
+        "isuse":"not_useful",
+        "use_reason":"",
     },
     config={"recursion_limit": 80},  # allow revise → verify loops
 )
 
 
 
-
 # -----------------------------
-# Debug / inspection output
+# Debug / inspection output (clean + complete)
 # -----------------------------
 print("\n===== RAG EXECUTION RESULT =====\n")
 
-print("Question:", result["question"])
+print("Question:", result.get("question"))
 print("Need Retrieval:", result.get("need_retrieval"))
 
+# If you added these counters/fields in your State:
+print("Rewrite tries (retrieval):", result.get("rewrite_tries", 0))
+print("Support revise tries:", result.get("retries", 0))
+
 print("\nRetrieval:")
-print("  Total retrieved docs:", len(result.get("docs", [])))
-print("  Relevant docs:", len(result.get("relevant_docs", [])))
+print("  Total retrieved docs:", len(result.get("docs", []) or []))
+print("  Relevant docs:", len(result.get("relevant_docs", []) or []))
+
+# Optional: show sources/pages for relevant docs
+relevant_docs = result.get("relevant_docs", []) or []
+if relevant_docs:
+    print("\nRelevant docs (source/page):")
+    for i, d in enumerate(relevant_docs, 1):
+        src = (d.metadata or {}).get("source", "unknown")
+        page = (d.metadata or {}).get("page", None)
+        title = (d.metadata or {}).get("title", "")
+        extra = f", title={title}" if title else ""
+        if page is not None:
+            print(f"  {i}. source={src}, page={page}{extra}")
+        else:
+            print(f"  {i}. source={src}{extra}")
 
 print("\nVerification (IsSUP):")
 print("  issup:", result.get("issup"))
-print("  evidence:")
-for e in result.get("evidence", []):
-    print("   -", e)
+evidence = result.get("evidence", []) or []
+if evidence:
+    print("  evidence:")
+    for e in evidence:
+        print("   -", e)
+else:
+    print("  evidence: (none)")
 
-print("\nFinal Answer:", result.get("answer"))
-print("Usefulness Status - ", result.get("isuse"))
-print("Usefulness Reason ", result.get("use_reason"))
+print("\nUsefulness (IsUSE):")
+print("  isuse:", result.get("isuse"))
+print("  reason:", result.get("use_reason", ""))
 
-print("\nRetries used:", result.get("retries", 0))
+print("\nFinal Answer:")
+print(result.get("answer"))
+
 print("\n===============================\n")
-
-
-
