@@ -342,7 +342,6 @@ g.add_edge("web_search", "is_relevant")  # 🔁 circle back
 g.add_edge("generate_from_context", END)
 
 app = g.compile()
-app
 
 result = app.invoke(
     {

@@ -19,7 +19,7 @@ pdf_path = documents_dir / "evs_oil_price_shock.pdf"
 loader = PyPDFLoader(str(pdf_path))
 docs = loader.load()
 print(f"Loaded {len(docs)} pages from the PDF.")
-# print(docs[0].page_content)
+
 
 # 2. Split documents into chunks
 splitter = RecursiveCharacterTextSplitter(chunk_size=900,chunk_overlap=100)
@@ -39,6 +39,7 @@ print("\nVector store created successfully.")
 retriever = vector_store.as_retriever(search_type="similarity",search_kwargs={"k":4})
 print("\nRetriever created successfully.")
 
+
 # 5.Graph State
 class AgenticRAGState(MessagesState):
     query:str
@@ -51,12 +52,70 @@ llm = ChatOpenAI(model="gpt-5-mini")
 
 #======1st NODE ======
 # retrieves relevant docs from the vector store
-def retrieve(state:AgenticRAGState)-> dict:
-    docs = retriever.invoke(state["query"])
-    context = "\n\n".join([d.page_content for d in docs]) # joiing each paragraph onto one
-    print(f"\nRetrieved {len(docs)} chunks.\n")
+def retrieve_node(state:AgenticRAGState)-> dict:
+    retrieved_docs = retriever.invoke(state["query"])
+    context = "\n\n".join([d.page_content for d in retrieved_docs]) # joining each  string onto one paragraph
+    print(f"\nRetrieved {len(retrieved_docs)} chunks.\n")
     return {
-        "retrieved_docs" : docs,
+        "retrieved_docs" : retrieved_docs,
         "context" : context
     }
+
+#======2nd NODE ======
+#generate a response using the retrieved context
+def generate_node(state:AgenticRAGState)-> dict:
+    query =  state["query"] #Pulling from State
+    context = state.get("context","")
+    prompt_template = ChatPromptTemplate.from_messages(
+        [
+            ("system", "Answer the question using only the context below. \n\nContext:\n{context}"),
+            ("human","Question: {query}")
+        ]
+    ) 
+    response = (prompt_template | llm).invoke({"context":context, "query" : query})
+    return {"response": response.content}
     
+    
+
+# build the RAG graph 
+g = StateGraph(AgenticRAGState)
+
+# add nodes to the graph
+g.add_node("retrieve",retrieve_node)
+g.add_node("generate",generate_node)
+
+# Edges
+g.add_edge(START, "retrieve")
+g.add_edge("retrieve","generate")
+g.add_edge("generate", END)
+
+graph = g.compile()
+
+result = graph.invoke(
+    {
+        "query":"How will EVs impact on oil demand in the next decade?",
+        
+        # Required by MessagesState (inherited by AgenticRAGState).
+        # Holds the conversation history for multi-turn chat.
+        "messages":[],
+        
+    }
+)
+
+print("\n===== FINAL RESULT =====\n")
+print(result["response"])
+
+
+# -----------------------------
+# Debug / inspection output (clean + complete)
+# -----------------------------
+print("\n=== RETRIEVED DOCUMENTS ===")
+for i, doc in enumerate(result["retrieved_docs"], 1):
+    source = doc.metadata.get("source", "unknown")
+    page = doc.metadata.get("page", "?")
+    snippet = doc.page_content[:500].replace("\n", " ")
+    print(f"[{i}] Source: {source} | Page: {page}")
+    print(f"    {snippet}...")
+    
+print("\n=====RETRIEVED CONTEXT===") 
+print(result["context"])
