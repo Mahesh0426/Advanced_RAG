@@ -21,6 +21,7 @@ base_dir = Path(__file__).resolve().parent
 documents_dir = base_dir / "documents"
 pdf_path = documents_dir / "evs_oil_price_shock.pdf"
 
+
 # 1. Load the PDF
 loader = PyPDFLoader(str(pdf_path))
 docs = loader.load()
@@ -51,8 +52,10 @@ class AgenticRAGState(MessagesState):
     context:Annotated[str,operator.add] # "PDF result" + "Web result"
     generation:str
     needs_retrieval:bool
+    retrieval_count: int       # incremented after each tool-call round
+    max_retrieval_steps: int   # cap on tool-call rounds before forcing generate
     
-    
+
 # ----------------1st TOOL -----------------
 # Register this function as a tool and return both text and raw documents
 @tool(response_format="content_and_artifact") # content  → text for LLM, artifact → raw objects for workflow
@@ -63,7 +66,6 @@ def vector_store_search(query:str,k:int=3):
     # Search vector database and return top-k matching chunks
     retriever = vector_store.as_retriever(search_type = "similarity",search_kwargs={"k":k})
     docs = retriever.invoke(query) # Perform Search | # Retrieve the most relevant document chunks for the query
-    
     
     # Merge retrieved chunks into a single text context for the LLM
     context = "\n\n## Vector Store Results\n\n" + "\n\n".join([d.page_content for d in docs]) # merge into one context string for llm
@@ -89,7 +91,7 @@ def web_search(query:str, max_results:int=3):
     ]
     content = "\n\n## web Search Results\n\n" + "\n\n".join([d.page_content for d in docs])
     return content,docs
-    
+
 
 # Register all available tools that the agent can use
 tools = [vector_store_search,web_search]
@@ -99,11 +101,12 @@ agent_llm_with_tools = agent_llm.bind_tools(tools) # LLM + Tools = Tool-Calling 
 tool_node = ToolNode(tools) # a node that can execute any of the defined tools
 
 
+
 #======2nd NODE (Router node)======
 # 7.a structure output schema for the routing decision for llm
 class RouteDecision(BaseModel):
     need_retrieval:bool
- 
+    
 # 7.b route_question node - it classifies whether the query needs documents for retrieval or not.
 def route_question_node(state:AgenticRAGState) -> dict:
     
@@ -146,6 +149,12 @@ def agent_node(state:AgenticRAGState)->dict:
     if not messages:
         messages = [SystemMessage(content=AGENT_SYSTEM_PROMPT),
                     HumanMessage(content=state["query"])]
+    
+    # LLM processes conversation and may decide to call tools or answer directly
+    response = agent_llm_with_tools.invoke(messages)
+
+    return {"messages": [response]}
+
 
 # LLM processes conversation and may decide to call tools or answer directly
     response = agent_llm_with_tools.invoke(messages)
@@ -171,13 +180,13 @@ def collect_tool_output_node(state: AgenticRAGState) ->dict:
 
     
     for msg in tool_message:
-        context_parts.append(msg.content) # Collect human-readable tool output text | append - returned nested lists
+        context_parts.append(msg.content) # Collect human-readable tool output text | append - returned nested lists [1,2,[3,4]]
         all_docs.extend(msg.artifact)  # # Collect raw documents from tool outputs | extend - returned single combined list
     return{
         "context": "\n\n".join(context_parts),  # Combine all tool outputs into a single context string for LLM
         "retrieved_docs": all_docs # Store all raw documents retrieved from tools
     }
-        
+    
 #======5th NODE======
 # 10.generate_node - produce the final answer with o without a retrieve context
 def generate_node(state: AgenticRAGState)->dict:
@@ -202,8 +211,21 @@ def generate_node(state: AgenticRAGState)->dict:
         
     # Store final answer in graph state
     return {"generation": response.content}  
+
+
+#======6th NODE======
+# 11. check_retrieval_limit node — increments the retrieval counter after each tool round
+def check_retrieval_limit_node(state: AgenticRAGState) -> dict:
+    count = state.get("retrieval_count", 0)
+    
+    return {"retrieval_count": count + 1}
+
+
+# ==============================
+# ROUTING FUNCTIONS
+# ==============================
         
-# ======= 11. The conditional ROUTER (routing function) =====   
+# ======= 12. The conditional ROUTER (routing function) =====   
 def route_after_classification(state: AgenticRAGState)->Literal["agent_node","generate_node"]:
      # Decide whether to use agent tools or go directly to final generation
     return "agent_node" if state["needs_retrieval"] else "generate_node"
@@ -211,7 +233,12 @@ def route_after_classification(state: AgenticRAGState)->Literal["agent_node","ge
 def route_after_agent(state:AgenticRAGState) -> Literal["tool_node","collect_tool_output_node"]:
     return "tool_node" if state["messages"][-1].tool_calls else "collect_tool_output_node"
     # If tool calls exist → execute tool; otherwise → process results
-    
+
+# Decide whether the agent gets another tool-calling round, or is forced to stop
+def route_after_limit_check(state: AgenticRAGState) -> Literal["agent_node", "collect_tool_output_node"]:
+    return "collect_tool_output_node" if state["retrieval_count"] >= state["max_retrieval_steps"] else "agent_node"
+
+
      
 # 12. Graph defination
 g = StateGraph(AgenticRAGState)
@@ -220,77 +247,87 @@ g.add_node("agent_node",agent_node)
 g.add_node("collect_tool_output_node",collect_tool_output_node)
 g.add_node("generate_node",generate_node)
 g.add_node("tool_node",tool_node)
+g.add_node("check_retrieval_limit_node",check_retrieval_limit_node)
 
 # 12. edges
 g.add_edge(START,"route_question_node")
 g.add_conditional_edges("route_question_node",route_after_classification)
 g.add_conditional_edges("agent_node",route_after_agent)
-g.add_edge("tool_node","agent_node")
+g.add_edge("tool_node", "check_retrieval_limit_node")
+g.add_conditional_edges("check_retrieval_limit_node", route_after_limit_check)
 g.add_edge("collect_tool_output_node", "generate_node")
 g.add_edge("generate_node",END)
 
 graph = g.compile()
-save_path = base_dir / "agentic_rag_step03.png"
+save_path = base_dir / "agentic_rag_step04.png"
 png_data = graph.get_graph().draw_mermaid_png()
 with open(save_path, "wb") as f:
     f.write(png_data)
 print("Graph saved successfully!")
 
 
-
 # Case 1: vector store only — domain-specific question about the PDF
 query_vs = "According to the report, how will the adoption of electric vehicles impact oil demand?"
-result_vs = graph.invoke({"query": query_vs, "messages": [], "retrieved_docs": [], "context": ""})
+result_vs = graph.invoke({"query": query_vs, "messages": [], "retrieved_docs": [], "context": "", "retrieval_count": 0, "max_retrieval_steps": 5})
 
 print("=== CASE 1: Vector Store Only ===")
-print(f"needs_retrieval : {result_vs['needs_retrieval']}")
-print(f"retrieved_docs  : {len(result_vs.get('retrieved_docs') or [])} docs")
-print(f"context preview : {result_vs.get('context', '')[:120]}...")
+print(f"needs_retrieval  : {result_vs['needs_retrieval']}")
+print(f"retrieval_count  : {result_vs['retrieval_count']}")
+print(f"retrieved_docs   : {len(result_vs.get('retrieved_docs') or [])} docs")
+print(f"context preview  : {result_vs.get('context', '')[:120]}...")
 print(f"\nGeneration:\n{result_vs['generation']}")
 
-print(result_vs["context"])
 
 
 # Case 2: web search only — current information not in the PDF
 query_web = "What is the current temperature in Sydney?"
-result_web = graph.invoke({"query": query_web, "messages": [], "retrieved_docs": [], "context": ""})
+result_web = graph.invoke({"query": query_web, "messages": [], "retrieved_docs": [], "context": "", "retrieval_count": 0, "max_retrieval_steps": 5})
 
-print(f"\n=== CASE 2: Web Search Only ===")
-print(f"needs_retrieval : {result_web['needs_retrieval']}")
-print(f"retrieved_docs  : {len(result_web.get('retrieved_docs') or [])} docs")
-print(f"context preview : {result_web.get('context', '')[:120]}...")
+print("=== CASE 2: Web Search Only ===")
+print(f"needs_retrieval  : {result_web['needs_retrieval']}")
+print(f"retrieval_count  : {result_web['retrieval_count']}")
+print(f"retrieved_docs   : {len(result_web.get('retrieved_docs') or [])} docs")
+print(f"context preview  : {result_web.get('context', '')[:120]}...")
 print(f"\nGeneration:\n{result_web['generation']}")
 
 
-
 # Case 3: both tools — requires document context AND current web data
-query_both = "Compare what the EV report projects for 2030 oil demand and also tell me about the weather in melbourne"
-result_both = graph.invoke({"query": query_both, "messages": [], "retrieved_docs": [], "context": ""})
+query_both = "Compare what the EV report projects for 2030 oil demand with current oil demand due to Iran-US War."
+result_both = graph.invoke({"query": query_both, "messages": [], "retrieved_docs": [], "context": "", "retrieval_count": 0, "max_retrieval_steps": 5})
 
 print("\n=== CASE 3: Both Tools ===")
-print(f"needs_retrieval : {result_both['needs_retrieval']}")
-print(f"retrieved_docs  : {len(result_both.get('retrieved_docs') or [])} docs")
-print(f"context preview : {result_both.get('context', '')[:120]}...")
+print(f"needs_retrieval  : {result_both['needs_retrieval']}")
+print(f"retrieval_count  : {result_both['retrieval_count']}")
+print(f"retrieved_docs   : {len(result_both.get('retrieved_docs') or [])} docs")
+print(f"context preview  : {result_both.get('context', '')[:120]}...")
 print(f"\nGeneration:\n{result_both['generation']}")
 
-print(result_both["context"])
+# Case 3b: multi-round retrieval — query designed to trigger iterative tool calls
+# The agent is expected to: (1) search the vector store for report projections,
+# then (2) search the web for current data, then (3) search again to fill any gaps.
+query_multi = (
+    "Step 1: Look up what the EV report projects for oil demand displacement by 2030 and 2050. "
+    "Step 2: Search for the latest 2024-2025 EV sales data and battery cost trends. "
+    "Step 3: Search for any recent analyst forecasts that revise those oil demand projections upward or downward. "
+    "Synthesize all three into a coherent answer."
+)
+result_multi = graph.invoke({"query": query_multi, "messages": [], "retrieved_docs": [], "context": "", "retrieval_count": 0, "max_retrieval_steps": 5})
+
+print("\n=== CASE 3b: Multi-Round Retrieval ===")
+print(f"needs_retrieval  : {result_multi['needs_retrieval']}")
+print(f"retrieval_count  : {result_multi['retrieval_count']}")
+print(f"retrieved_docs   : {len(result_multi.get('retrieved_docs') or [])} docs")
+print(f"context preview  : {result_multi.get('context', '')[:120]}...")
+print(f"\nGeneration:\n{result_multi['generation']}")
+
 
 # Case 4: no retrieval — answerable from general knowledge
 query_none = "Explain the difference between kinetic energy and potential energy."
-result_none = graph.invoke({"query": query_none, "messages": [], "retrieved_docs": [], "context": ""})
+result_none = graph.invoke({"query": query_none, "messages": [], "retrieved_docs": [], "context": "", "retrieval_count": 0, "max_retrieval_steps": 5})
 
-print("\n=== CASE 4: No Retrieval ===")
-print(f"needs_retrieval : {result_none['needs_retrieval']}")
-print(f"retrieved_docs  : {len(result_none.get('retrieved_docs') or [])} docs")
-print(f"context preview : {result_none.get('context', '') or '(none)'}")
+print("=== CASE 4: No Retrieval ===")
+print(f"needs_retrieval  : {result_none['needs_retrieval']}")
+print(f"retrieval_count  : {result_none['retrieval_count']}")
+print(f"retrieved_docs   : {len(result_none.get('retrieved_docs') or [])} docs")
+print(f"context preview  : {result_none.get('context', '') or '(none)'}")
 print(f"\nGeneration:\n{result_none['generation']}")
-
-result_both["messages"][0].tool_calls
-    
-
-    
-
-
-    
-
-
