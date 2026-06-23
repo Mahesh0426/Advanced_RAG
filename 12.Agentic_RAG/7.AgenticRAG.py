@@ -58,6 +58,7 @@ class AgenticRAGState(MessagesState):
     rewritten_query: str
     rewrite_count:int
     needs_decomposition: bool
+    constructed_prompt:str
     
     
 # ----------------1st TOOL -----------------
@@ -127,7 +128,6 @@ def check_decomposition_node(state: AgenticRAGState) -> dict:
     
     return {"needs_decomposition": result.needs_decomposition}
 
-
 #===========3rd NODE ======
 #9.decompose_query_node - it decomposes the given query into sub queries 
 def decompose_query_node(state: AgenticRAGState) -> dict:
@@ -144,9 +144,15 @@ def decompose_query_node(state: AgenticRAGState) -> dict:
     chain = prompt_template | llm.with_structured_output(DecompositionDecision)
     result = chain.invoke({"query": state["query"]})
     
-    formatted = "\n".join(f"Step {i+1}: {q}" for i, q in enumerate(result.sub_queries))
+    steps = "\n".join(f"Step {i+1}: {q}" for i, q in enumerate(result.sub_queries))
+    formatted = (
+        f"You must call a retrieval tool for each of the following {len(result.sub_queries)} steps "
+        f"before answering. Do not skip any step.\n\n{steps}"
+    )
     
     return {"query": formatted}
+
+
 
 #=========4th NODE ======
 # 10.a structure output schema for the routing decision for llm
@@ -279,37 +285,74 @@ def rewrite_query_node(state: AgenticRAGState) -> dict :
 
     return {"rewritten_query": new_query, "rewrite_count": count + 1}
 
-
 #======9th NODE======
+# build_prompt_node
+def build_prompt_node(state: AgenticRAGState)-> dict:
+    rewrite_count = state.get("rewrite_count", 0)
+    is_relevant = state.get("is_relevant", False)
+    
+    if rewrite_count >= 3 and not is_relevant:
+        return {"constructed_prompt": "FALLBACK"}
+    
+    sections = ["You are a knowledgeable assistant."]
+    
+    if state.get("needs_decomposition"):
+        sections.append(
+            "The question was complex and split into sub-queries for retrieval. "
+            "Synthesize a single coherent answer covering all parts."
+        )
+        
+    if state.get("rewritten_query"):
+        sections.append("The original query was reformulated during retrieval to improve result quality.")
+
+    
+    context = state.get("context") or ""
+    relevant_docs = state.get("relevant_docs") or []
+    
+    if context:
+        web_docs = [d for d in relevant_docs if d.metadata.get("source", "").startswith("http")]
+        pdf_docs = [d for d in relevant_docs if not d.metadata.get("source", "").startswith("http")]
+
+        if web_docs and pdf_docs:
+            sections.append("Answer using the following context from the internal document and web search:")
+        elif web_docs:
+            sections.append("Answer using the following context from web search:")
+        else:
+            sections.append("Answer using the following context from the internal document:")
+
+        sections.append(f"Context:\n{context}")
+
+        if web_docs:
+            urls = "\n".join(f"- {d.metadata['source']}" for d in web_docs)
+            sections.append(f"Sources:\n{urls}")
+    else:
+        sections.append("No relevant documents were found. Answer from your general knowledge if possible.")
+        
+    return {"constructed_prompt": "\n\n".join(sections)}
+
+
+#======10th NODE======
 # 15. generate_node
-def generate_node(state:AgenticRAGState) ->dict:
-    # No answer fallback when all rewrite attempts are existed with no relevant docs.
-    if state.get("rewrite_count",0)>= 3 and not state.get("is_relevant"):
-        return{
-            "generation":(
-                "I was unable to find the relevant information to answer your query after multiple retribble attempts."
+def generate_node(state: AgenticRAGState) -> dict:
+    if state.get("constructed_prompt") == "FALLBACK":
+        return {
+            "generation": (
+                "I was unable to find relevant information to answer your query after multiple retrieval attempts. "
                 "The knowledge source does not appear to contain content that addresses this question."
             )
         }
-    
-    query = state["query"]
-    context = state.get("context") or ""
-    
-    if context:
-        prompt_template = ChatPromptTemplate.from_messages([
-            ("system", "Answer the question using only the context below.\n\nContext:\n{context}"),
-            ("human", "{query}"),
-        ])
-        response = (prompt_template | llm).invoke({"context":context, "query":query})
-    else:
-        prompt_template = ChatPromptTemplate.from_messages([
-            ("system", "Answer the following question from your general knowledge."),
-            ("human", "Query: {query}"),
-        ])
-        response = (prompt_template | llm).invoke({"query":query})
-    return {"generation":response.content}
 
-#======10th NODE======
+    prompt_template = ChatPromptTemplate.from_messages([
+        ("system", "{constructed_prompt}"),
+        ("human", "{query}"),
+    ])
+    response = (prompt_template | llm).invoke({
+        "constructed_prompt": state["constructed_prompt"],
+        "query": state["query"],
+    })
+    return {"generation": response.content}
+
+#======11th NODE======
 # 16. check_retrieval_limit node — increments the retrieval counter after each tool round
 def check_retrieval_limit_node(state: AgenticRAGState) -> dict:
     count = state.get("retrieval_count", 0)
@@ -321,9 +364,9 @@ def check_retrieval_limit_node(state: AgenticRAGState) -> dict:
 # ==============================
         
 # ======= 17. The conditional ROUTER (routing function) =====   
-def route_after_classification(state: AgenticRAGState)->Literal["check_decomposition_node","generate_node"]:
+def route_after_classification(state: AgenticRAGState)->Literal["check_decomposition_node","build_prompt_node"]:
      # Decide whether to use agent tools or go directly to final generation
-    return "check_decomposition_node" if state["needs_retrieval"] else "generate_node"
+    return "check_decomposition_node" if state["needs_retrieval"] else "build_prompt_node"
 
 def route_after_decomposition_check(state: AgenticRAGState) -> Literal["decompose_query_node", "agent_node"]:
     return "decompose_query_node" if state["needs_decomposition"] else "agent_node"
@@ -336,11 +379,11 @@ def route_after_agent(state:AgenticRAGState) -> Literal["tool_node","collect_too
 def route_after_limit_check(state: AgenticRAGState) -> Literal["agent_node", "collect_tool_output_node"]:
     return "collect_tool_output_node" if state["retrieval_count"] >= state["max_retrieval_steps"] else "agent_node"
 
-def route_after_evaluation(state: AgenticRAGState) -> Literal["generate_node","rewrite_query_node" ]:
-    return "generate_node" if state["is_relevant"] else "rewrite_query_node"
+def route_after_evaluation(state: AgenticRAGState) -> Literal["build_prompt_node","rewrite_query_node" ]:
+    return "build_prompt_node" if state["is_relevant"] else "rewrite_query_node"
 
-def route_after_rewrite(state: AgenticRAGState)-> Literal["agent_node", "generate_node"]:
-    return "generate_node" if state.get("rewrite_count", 0) >= 3 else "agent_node"
+def route_after_rewrite(state: AgenticRAGState)-> Literal["agent_node", "build_prompt_node"]:
+    return "build_prompt_node" if state.get("rewrite_count", 0) >= 3 else "agent_node"
 
 
 
@@ -355,6 +398,7 @@ g.add_node("agent_node",agent_node)
 g.add_node("collect_tool_output_node",collect_tool_output_node)
 g.add_node("evaluate_docs_node",evaluate_docs_node)
 g.add_node("rewrite_query_node",rewrite_query_node)
+g.add_node("build_prompt_node",build_prompt_node)
 g.add_node("generate_node",generate_node)
 g.add_node("check_retrieval_limit_node",check_retrieval_limit_node)
 
@@ -369,17 +413,18 @@ g.add_conditional_edges("check_retrieval_limit_node",route_after_limit_check)
 g.add_edge("collect_tool_output_node","evaluate_docs_node")
 g.add_conditional_edges("evaluate_docs_node",route_after_evaluation)
 g.add_conditional_edges("rewrite_query_node",route_after_rewrite)
+g.add_edge("build_prompt_node","generate_node")
 g.add_edge("generate_node",END)
 
 graph = g.compile()
-save_path = base_dir / "agentic_rag_step06.png"
+save_path = base_dir / "agentic_rag_step07.png"
 png_data = graph.get_graph().draw_mermaid_png()
 with open(save_path, "wb") as f:
     f.write(png_data)
 print("Graph saved successfully!")
 
 
-# Case 1: simple query — expect no decomposition, query unchanged
+# Case 1: simple query — PDF source, no decomposition
 query_1 = (
     "According to the report, by how many million barrels per day could a 300-million EV fleet "
     "displace oil demand by 2030?"
@@ -391,26 +436,26 @@ result_1 = graph.invoke({
     "retrieved_docs": [],
     "relevant_docs": [],
     "context": "",
+    "constructed_prompt": "",
     "retrieval_count": 0,
     "max_retrieval_steps": 3,
     "rewrite_count": 0,
     "rewritten_query": "",
 })
-
 print("\nQUERY:",query_1)
-print("=== Case 1: Simple query — no decomposition ===")
-print("Final query:", result_1.get("query"))
+print("\n=== Case 1: Simple query — no decomposition ===")
 print("Is relevant:", result_1.get("is_relevant"))
 print("Relevant docs count:", len(result_1.get("relevant_docs") or []))
+print("\nConstructed prompt:\n", result_1.get("constructed_prompt"))
 print("\nGeneration:\n", result_1.get("generation"))
 
 
 
 # Case 2: complex multi-part query — expect decomposition into numbered steps
-
+# Case 2: complex multi-part query — decomposition expected
 query_2 = (
-    "Impact of EVs on the oil industry, "
-    "and what is the current price of oil in US dollars for Brent Crude"
+    "According to the report, how much have battery pack costs fallen over the past decade, "
+    "and what is the current weather in Delhi"
 )
 
 result_2 = graph.invoke({
@@ -419,16 +464,17 @@ result_2 = graph.invoke({
     "retrieved_docs": [],
     "relevant_docs": [],
     "context": "",
+    "constructed_prompt": "",
     "retrieval_count": 0,
-    "max_retrieval_steps": 10,
+    "max_retrieval_steps": 6,
     "rewrite_count": 0,
     "rewritten_query": "",
 })
 print("\nQUERY:",query_2)
-print("=== Case 2: Complex query — decomposition expected ===")
+print("\n=== Case 2: Complex query — decomposition expected ===")
 print("Final query (after decomposition):\n", result_2.get("query"))
 print("\nIs relevant:", result_2.get("is_relevant"))
 print("Relevant docs count:", len(result_2.get("relevant_docs") or []))
 print("Retrieval count:", result_2.get("retrieval_count"))
+print("\nConstructed prompt:\n", result_2.get("constructed_prompt"))
 print("\nGeneration:\n", result_2.get("generation"))
-
