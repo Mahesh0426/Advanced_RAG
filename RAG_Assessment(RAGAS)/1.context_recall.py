@@ -1,3 +1,8 @@
+# Context Recall : measures whether the retrieved context necessary for answering the question
+# Low score = covers few key information
+# High score = covers all key information
+
+
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from ragas.llms import llm_factory
@@ -24,7 +29,8 @@ async def main():
         ],
         reference="Type 2 diabetes is caused by insulin resistance, often linked to obesity and a sedentary lifestyle. Its symptoms include frequent urination, excessive thirst, fatigue, blurred vision, and slow-healing sores."
     )
-    print(f"Context Recall Score: {result.value}")
+    print(f"Context Recall Score 1: {result.value}")
+    # Context Recall Score: 0.5714285714285714
 
 asyncio.run(main())
 
@@ -39,6 +45,7 @@ async def main2():
         reference="The Eiffel Tower is located in Paris, France."
     )
     print(f"Context Recall Score 2: {result.value}")
+    # Context Recall Score: 1.0
 
 asyncio.run(main2())
 
@@ -52,6 +59,7 @@ async def main3():
     reference="Parkinson's disease is caused by the loss of dopamine-producing neurons in the brain. It is characterized by tremors, stiffness, slowness of movement, and balance problems."
     )
     print(f"Context Recall Score 3: {result.value}")
+    # Context Recall Score: 0.0
 
 asyncio.run(main3())
 
