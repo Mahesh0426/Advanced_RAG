@@ -1,6 +1,6 @@
 # Faithfulness: measures whether the response is factually consistent with the provided reference text
-# Low score =  Good
-# High score = Bad
+# Low score =  bad
+# High score = good
 
 from openai import AsyncOpenAI
 from ragas.llms import llm_factory
